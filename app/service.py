@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from bisect import bisect_left
 from contextlib import closing
 
 from . import calibration
@@ -349,6 +350,139 @@ def _endpoint_dict(conn: sqlite3.Connection, obs: sqlite3.Row) -> dict:
         "timestamp_iso": epoch_to_iso(obs["ts"]),
         "bias": obs["bias"],
         "outliers": [r["value"] for r in outliers],
+    }
+
+
+# ---------- 历史时点状态重建与只读补偿查询 ----------
+
+def _historical_point(
+    obs: sqlite3.Row | dict,
+    version_snap: sqlite3.Row | None,
+    revision: int,
+    readings: list[float],
+    tolerance: float,
+) -> dict:
+    """构造单个观测在某系统时点上正在生效的版本状态。
+
+    version_snap 为 None 时取当前行数据；否则取修订快照：快照 revision=k 保存的
+    正是第 k 版的输入（第 k 次修订前的状态），与 revision 标签一致。
+    """
+    if version_snap is None:
+        ts, bias = obs["ts"], obs["bias"]
+    else:
+        ts, bias = version_snap["old_ts"], version_snap["old_bias"]
+    _median, _inliers, outlier_values = calibration.split_outliers(readings, tolerance)
+    return {
+        "id": obs["id"],
+        "revision": revision,
+        "ts": ts,
+        "bias": bias,
+        "outliers": outlier_values,
+    }
+
+
+def _reconstruct_historical_points(conn: sqlite3.Connection, as_of: float) -> list[dict]:
+    """重建 as_of 系统时点可见的校准状态，按观测时点升序返回。
+
+    - created_at > as_of 的观测当时尚未创建，不参与；
+    - 修订自 changed_at 时刻起生效：changed_at <= as_of 才采用新版本，
+      恰等于变更时刻时使用新版本；
+    - 当前行代表最新版本；快照链回溯各历史版本（快照 revision=k 即第 k 版）。
+    仅执行 SELECT，不触碰写库状态。
+    """
+    rows = conn.execute(
+        "SELECT * FROM observations WHERE created_at <= ? ORDER BY id", (as_of,)
+    ).fetchall()
+    points = []
+    for obs in rows:
+        latest = conn.execute(
+            "SELECT * FROM revisions WHERE observation_id = ? AND changed_at <= ?"
+            " ORDER BY revision DESC LIMIT 1",
+            (obs["id"], as_of),
+        ).fetchone()
+        # 已生效的最近一次修订把版本从 k 推进到 k+1；无则仍为第 1 版
+        live_revision = latest["revision"] + 1 if latest is not None else 1
+        if live_revision == obs["revision"]:
+            # 生效版本即当前版本：取当前行与读数表
+            reading_rows = conn.execute(
+                "SELECT value FROM readings WHERE observation_id = ? ORDER BY id", (obs["id"],)
+            ).fetchall()
+            point = _historical_point(
+                obs, None, live_revision,
+                [r["value"] for r in reading_rows], obs["tolerance"],
+            )
+        else:
+            # 生效版本已归档：revision=live_revision 的快照保存其全部输入
+            version_snap = conn.execute(
+                "SELECT * FROM revisions WHERE observation_id = ? AND revision = ?",
+                (obs["id"], live_revision),
+            ).fetchone()
+            point = _historical_point(
+                obs, version_snap, live_revision,
+                json.loads(version_snap["old_readings"]), version_snap["old_tolerance"],
+            )
+        points.append(point)
+    points.sort(key=lambda p: p["ts"])
+    return points
+
+
+def historical_correct(as_of: float, ts: float, reading: float) -> dict:
+    """在 as_of 系统时点可见的校准状态下，对目标观测时点 ts 的读数做漂移补偿。
+
+    依据 observations.created_at 与 revisions 快照重建当时状态（不使用 intervals
+    区间表），随后复用与当前补偿一致的覆盖范围与相邻点线性插值规则。整个查询
+    只读：连接以 query_only 打开，不改写观测、修订历史或区间表。
+    """
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")
+        points = _reconstruct_historical_points(conn, as_of)
+        if not points:
+            raise OutOfCoverageError(ts, None, None)
+        lo, hi = points[0]["ts"], points[-1]["ts"]
+        if ts < lo or ts > hi:
+            raise OutOfCoverageError(ts, lo, hi)
+
+        # 按重建出的观测时点定位：先尝试精确命中，再取夹住 ts 的相邻两点
+        times = [p["ts"] for p in points]
+        idx = bisect_left(times, ts)
+        if idx < len(points) and points[idx]["ts"] == ts:
+            exact = points[idx]
+            bias = exact["bias"]
+            interval = None
+            endpoints = [exact]
+        else:
+            left, right = points[idx - 1], points[idx]
+            bias = calibration.interpolate(ts, left["ts"], left["bias"], right["ts"], right["bias"])
+            interval = {
+                "t_start": left["ts"],
+                "t_end": right["ts"],
+                "start_iso": epoch_to_iso(left["ts"]),
+                "end_iso": epoch_to_iso(right["ts"]),
+                "bias_start": left["bias"],
+                "bias_end": right["bias"],
+            }
+            endpoints = [left, right]
+        return {
+            "as_of": as_of,
+            "as_of_iso": epoch_to_iso(as_of),
+            "timestamp": ts,
+            "timestamp_iso": epoch_to_iso(ts),
+            "reading": reading,
+            "bias": bias,
+            "corrected": reading + bias,
+            "interval": interval,
+            "endpoints": [_historical_endpoint_dict(p) for p in endpoints],
+        }
+
+
+def _historical_endpoint_dict(point: dict) -> dict:
+    return {
+        "observation_id": point["id"],
+        "revision": point["revision"],
+        "timestamp": point["ts"],
+        "timestamp_iso": epoch_to_iso(point["ts"]),
+        "bias": point["bias"],
+        "outliers": point["outliers"],
     }
 
 

@@ -25,6 +25,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 7. **修订与版本**：观测带单调递增的 `revision`（新建为 1）。`PUT` 修订须携带当前 `revision`，版本过期或目标时点已被占用均返回 409；成功后观测 ID 不变、版本 +1，并保存一份修订前快照（旧输入与旧偏差），可通过修订历史接口按版本倒序查询。
 8. **累计漂移量**：`GET /drift-integral?from=&to=` 在覆盖范围内对当前分段线性 `bias` 做**解析积分**（精确梯形面积；段内 `bias` 过零时按解析交点拆分绝对值面积，不做固定步长采样），返回 `signed_bias_seconds`、`absolute_bias_seconds` 及按插值区间裁剪后的分段 `contributions`。窗口边界可落在区间内部；`from` 必须小于 `to`，任一边界越界返回 400。
 9. **漂移超限窗口分析**：`GET /drift-exceedances?from=&to=&limit=` 在覆盖范围内**解析求解**分段线性 `bias` 与 `±limit` 的交点（不做固定步长采样），返回 `|bias| > limit` 的连续区间，每段含方向（`high`/`low`）、持续秒数与区间内峰值绝对偏差；跨观测点仍连续且同向的片段合并为一段，恰等于阈值的瞬时不计入超限（观测点恰好触及阈值时两侧不合并）。`from` 必须小于 `to`、`limit` 必须为正数，任一边界越界返回 400。
+10. **历史时点补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 返回**指定系统时点 `as_of` 所能看到的校准状态**下，对目标观测时点 `effective_at` 读数的插值偏差与校正值。状态由 `observations.created_at`、当前版本与 `revisions` 快照重建：`created_at > as_of`（当时尚未创建）的观测不参与；修订自 `changed_at` 时刻起生效，恰等于变更时刻时使用新版本。随后按重建出的观测时点排序，复用与当前补偿一致的覆盖范围与相邻点线性插值规则。查询**只读**（不写观测、修订历史或区间表），响应附带 `as_of` 及所用端点的观测 ID、生效版本。
 
 ## API 一览
 
@@ -36,6 +37,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | GET | `/observations/{id}/revisions` | 按版本倒序列出修订前快照（旧输入与旧偏差） |
 | GET | `/intervals` | 列出当前插值区间 |
 | POST | `/corrections` | 对指定时点的读数做漂移补偿 |
+| GET | `/historical-correction` | 重建 `as_of` 系统时点的校准状态，对 `effective_at` 读数做只读补偿查询 |
 | GET | `/drift-integral` | 对覆盖范围内分段线性偏差做精确积分（累计漂移量） |
 | GET | `/drift-exceedances` | 解析求解偏差越出 ±limit 的连续区间（方向/持续秒数/峰值） |
 | GET | `/health` | 健康检查 |
@@ -144,6 +146,64 @@ curl -X POST http://localhost:8000/corrections \
   ]
 }
 ```
+
+### 历史时点补偿（只读）
+
+查询某个**系统时点 `as_of`** 所能看到的校准状态下，对**目标观测时点 `effective_at`** 读数的插值偏差与校正值。重建规则：
+
+- 观测自 `created_at` 起可见：`created_at > as_of` 的观测当时尚未创建，不参与（覆盖范围随之收缩）；
+- 修订自 `changed_at` 时刻起生效：`changed_at <= as_of` 才采用新版本，**恰等于变更时刻时使用新版本**；更早的版本通过修订快照回溯（含旧时点、旧偏差与旧异常读数）；
+- 按重建出的观测时点排序，复用与 `/corrections` 一致的覆盖范围与相邻点线性插值规则；恰落在当时观测点上时直接使用该点偏差。
+
+查询只读，不会改写当前观测、修订历史或区间表。响应在 `as_of`/`as_of_iso` 之外，还通过 `endpoints` 给出所用端点观测的 ID 与**当时生效的版本号 `revision`**。
+
+以上文两条观测（08:00 `bias 1.0`、10:00 `bias 3.0`）为例；假设 08:00 的观测在 `09:30` 被修订为 `bias 0.0`：
+
+```bash
+# 修订生效前（as_of = 09:29:59）：中点仍是旧 bias 1.0 与 3.0 的插值 2.0
+curl "http://localhost:8000/historical-correction?effective_at=2026-09-18T09:00:00Z&as_of=2026-09-18T09:29:59Z&reading=98.0"
+```
+
+```json
+{
+  "as_of": 1789723799.0, "as_of_iso": "2026-09-18T09:29:59+00:00",
+  "timestamp": 1789722000.0, "timestamp_iso": "2026-09-18T09:00:00+00:00",
+  "reading": 98.0, "bias": 2.0, "corrected": 100.0,
+  "interval": {"t_start": 1789718400.0, "t_end": 1789725600.0,
+               "start_iso": "2026-09-18T08:00:00+00:00", "end_iso": "2026-09-18T10:00:00+00:00",
+               "bias_start": 1.0, "bias_end": 3.0},
+  "endpoints": [
+    {"observation_id": 1, "revision": 1, "timestamp": 1789718400.0,
+     "timestamp_iso": "2026-09-18T08:00:00+00:00", "bias": 1.0, "outliers": [150.0]},
+    {"observation_id": 2, "revision": 1, "timestamp": 1789725600.0,
+     "timestamp_iso": "2026-09-18T10:00:00+00:00", "bias": 3.0, "outliers": []}
+  ]
+}
+```
+
+```bash
+# 恰等于变更时刻（as_of = 09:30:00）：新版本生效，中点偏差变为 1.5
+curl "http://localhost:8000/historical-correction?effective_at=2026-09-18T09:00:00Z&as_of=2026-09-18T09:30:00Z&reading=98.0"
+```
+
+```json
+{
+  "as_of": 1789723800.0, "as_of_iso": "2026-09-18T09:30:00+00:00",
+  "timestamp": 1789722000.0, "timestamp_iso": "2026-09-18T09:00:00+00:00",
+  "reading": 98.0, "bias": 1.5, "corrected": 99.5,
+  "interval": {"t_start": 1789718400.0, "t_end": 1789725600.0,
+               "start_iso": "2026-09-18T08:00:00+00:00", "end_iso": "2026-09-18T10:00:00+00:00",
+               "bias_start": 0.0, "bias_end": 3.0},
+  "endpoints": [
+    {"observation_id": 1, "revision": 2, "timestamp": 1789718400.0,
+     "timestamp_iso": "2026-09-18T08:00:00+00:00", "bias": 0.0, "outliers": []},
+    {"observation_id": 2, "revision": 1, "timestamp": 1789725600.0,
+     "timestamp_iso": "2026-09-18T10:00:00+00:00", "bias": 3.0, "outliers": []}
+  ]
+}
+```
+
+`effective_at` 超出 `as_of` 时刻已观测覆盖范围（含当时尚无任何观测）返回 400；三个查询参数缺一返回 422。
 
 ### 累计漂移量积分
 

@@ -14,6 +14,7 @@ from .models import (
     CorrectionOut,
     DriftExceedancesOut,
     DriftIntegralOut,
+    HistoricalCorrectionOut,
     IntervalOut,
     ObservationIn,
     ObservationOut,
@@ -120,6 +121,27 @@ def post_correction(payload: CorrectionIn) -> dict:
     """对指定时点的读数做漂移补偿；覆盖范围外拒绝。"""
     try:
         return service.correct(ts=payload.timestamp, reading=payload.reading)
+    except OutOfCoverageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/historical-correction", response_model=HistoricalCorrectionOut)
+def get_historical_correction(
+    effective_at: Annotated[Timestamp, Query(
+        description="目标观测时点：Unix 秒或 ISO 8601，待校正读数发生的时刻")],
+    as_of: Annotated[Timestamp, Query(
+        description="系统时点：仅该时刻已创建的观测与已生效修订参与状态重建")],
+    reading: Annotated[float, Query(description="待校正的原始读数")],
+) -> dict:
+    """重建 as_of 系统时点可见的校准状态，对 effective_at 处读数做漂移补偿。
+
+    尚未创建（created_at > as_of）的观测不参与；修订自 changed_at 时刻起生效
+    （恰等于变更时刻使用新版本）。随后按重建出的观测时点排序，复用既有覆盖范围
+    与相邻点线性插值规则。查询只读，不改写当前观测、修订历史或区间表；响应附带
+    as_of 及所用端点的观测 ID、版本。
+    """
+    try:
+        return service.historical_correct(as_of=as_of, ts=effective_at, reading=reading)
     except OutOfCoverageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

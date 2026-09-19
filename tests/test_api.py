@@ -539,3 +539,256 @@ def test_drift_exceedances_out_of_coverage_rejected(exceedance_points):
 def test_drift_exceedances_without_any_observation_rejected(client):
     resp = client.get("/drift-exceedances", params={"from": 1.0, "to": 2.0, "limit": 2.0})
     assert resp.status_code == 400
+
+
+# ---------- 历史时点补偿 ----------
+
+def set_created_at(obs_id, created_at):
+    """把观测的创建时间回拨到确定值（历史查询需要确定性的 created_at）。"""
+    from app.db import connect
+
+    with connect() as conn:
+        conn.execute("UPDATE observations SET created_at = ? WHERE id = ?", (created_at, obs_id))
+
+
+def set_changed_at(obs_id, revision, changed_at):
+    """把某次修订快照的变更时间回拨到确定值。"""
+    from app.db import connect
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE revisions SET changed_at = ? WHERE observation_id = ? AND revision = ?",
+            (changed_at, obs_id, revision),
+        )
+
+
+@pytest.fixture()
+def history_points(client):
+    # id=1: t=1000 bias 1.0；id=2: t=2000 bias 3.0；id=3: t=3000 bias 4.0
+    make_observation(client, 1000.0, 10.0, 0.5, [9.0, 9.1, 8.9, 20.0])
+    make_observation(client, 2000.0, 10.0, 0.5, [7.0, 7.1, 6.9])
+    make_observation(client, 3000.0, 10.0, 0.5, [6.0, 6.1, 5.9])
+    set_created_at(1, 100.0)
+    set_created_at(2, 200.0)
+    set_created_at(3, 300.0)
+    return client
+
+
+def historical_correction(client, **params):
+    return client.get("/historical-correction", params=params)
+
+
+def test_historical_correction_hides_not_yet_created_observations(history_points):
+    # as_of=150：只有 id=1（created_at=100）存在；覆盖范围 [1000,1000]
+    ok = historical_correction(history_points, effective_at=1000.0, as_of=150.0, reading=5.0)
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["as_of"] == pytest.approx(150.0)
+    assert body["bias"] == pytest.approx(1.0)
+    assert body["interval"] is None
+    assert [(e["observation_id"], e["revision"]) for e in body["endpoints"]] == [(1, 1)]
+    assert body["endpoints"][0]["outliers"] == [20.0]
+
+    # id=2、id=3 在 t=2000/3000 尚不可见 → 超出当时覆盖范围
+    miss = historical_correction(history_points, effective_at=2000.0, as_of=150.0, reading=5.0)
+    assert miss.status_code == 400
+    assert "outside calibration coverage" in miss.json()["detail"]
+
+
+def test_historical_correction_coverage_extends_as_observations_appear(history_points):
+    # as_of=250：id=1、id=2 已创建，id=3 尚未创建
+    body = historical_correction(
+        history_points, effective_at=1500.0, as_of=250.0, reading=5.0
+    ).json()
+    assert body["bias"] == pytest.approx(2.0)          # bias 1.0 与 3.0 的中点
+    assert body["corrected"] == pytest.approx(7.0)
+    assert (body["interval"]["t_start"], body["interval"]["t_end"]) == (1000.0, 2000.0)
+    assert [(e["observation_id"], e["revision"]) for e in body["endpoints"]] == [(1, 1), (2, 1)]
+    assert historical_correction(
+        history_points, effective_at=3000.0, as_of=250.0, reading=5.0
+    ).status_code == 400
+
+    # as_of=300（恰等于 id=3 的创建时刻）：创建时刻即可见
+    body = historical_correction(
+        history_points, effective_at=2500.0, as_of=300.0, reading=0.0
+    ).json()
+    assert body["bias"] == pytest.approx(3.5)          # bias 3.0 与 4.0 的中点
+    assert [(e["observation_id"], e["revision"]) for e in body["endpoints"]] == [(2, 1), (3, 1)]
+
+
+def test_historical_correction_revision_takes_effect_at_changed_at(history_points):
+    # 修订 id=1（t=1000）：偏差 1.0 → 0.0，revision 1 -> 2，变更时刻 500
+    resp = revise_observation(history_points, 1, 1000.0, 10.0, 0.5,
+                              [10.0, 10.1, 9.9], revision=1)
+    assert resp.status_code == 200, resp.text
+    set_changed_at(1, revision=1, changed_at=500.0)
+
+    # as_of=499：修订尚未生效，仍按旧 bias 1.0 插值
+    before = historical_correction(
+        history_points, effective_at=1500.0, as_of=499.0, reading=0.0
+    ).json()
+    assert before["bias"] == pytest.approx(2.0)
+    assert before["endpoints"][0]["revision"] == 1
+    assert before["endpoints"][0]["bias"] == pytest.approx(1.0)
+
+    # as_of=500：恰等于变更时刻，使用新版本 bias 0.0
+    at = historical_correction(
+        history_points, effective_at=1500.0, as_of=500.0, reading=0.0
+    ).json()
+    assert at["bias"] == pytest.approx(1.5)
+    assert at["endpoints"][0]["revision"] == 2
+    assert at["endpoints"][0]["bias"] == pytest.approx(0.0)
+
+
+def test_historical_correction_second_revision_boundary(history_points):
+    # 连续两次修订：bias 1.0 -> 0.0 -> 2.0；changed_at 分别为 500、900
+    revise_observation(history_points, 1, 1000.0, 10.0, 0.5,
+                       [10.0, 10.1, 9.9], revision=1)
+    set_changed_at(1, revision=1, changed_at=500.0)
+    revise_observation(history_points, 1, 1000.0, 10.0, 0.5,
+                       [8.0, 8.1, 7.9], revision=2)
+    set_changed_at(1, revision=2, changed_at=900.0)
+
+    def bias_at(as_of):
+        return historical_correction(
+            history_points, effective_at=1000.0, as_of=as_of, reading=0.0
+        ).json()
+
+    assert bias_at(499.0)["bias"] == pytest.approx(1.0)
+    assert bias_at(499.0)["endpoints"][0]["revision"] == 1
+    assert bias_at(500.0)["bias"] == pytest.approx(0.0)
+    assert bias_at(500.0)["endpoints"][0]["revision"] == 2
+    assert bias_at(899.0)["bias"] == pytest.approx(0.0)
+    assert bias_at(900.0)["bias"] == pytest.approx(2.0)
+    assert bias_at(900.0)["endpoints"][0]["revision"] == 3
+
+
+def test_historical_correction_uses_timestamp_at_revision_time(history_points):
+    # id=1 在当前状态位于 t=500（bias 0.5），但修订发生在 500：
+    # as_of=499 时它仍在旧位置 t=1000（bias 1.0）
+    resp = revise_observation(history_points, 1, 500.0, 10.0, 0.5,
+                              [9.5, 9.6, 9.4], revision=1)
+    assert resp.status_code == 200, resp.text
+    set_changed_at(1, revision=1, changed_at=500.0)
+
+    # 旧状态：区间 (1000, 2000)，中点 1500 bias 2.0
+    before = historical_correction(
+        history_points, effective_at=1500.0, as_of=499.0, reading=0.0
+    ).json()
+    assert before["bias"] == pytest.approx(2.0)
+    assert (before["interval"]["t_start"], before["interval"]["t_end"]) == (1000.0, 2000.0)
+
+    # 新状态：区间 (500, 2000)，t=1500 为 2/3 处：0.5 + (3.0-0.5)*1000/1500
+    after = historical_correction(
+        history_points, effective_at=1500.0, as_of=500.0, reading=0.0
+    ).json()
+    assert after["bias"] == pytest.approx(0.5 + 2.5 * 1000 / 1500)
+    assert (after["interval"]["t_start"], after["interval"]["t_end"]) == (500.0, 2000.0)
+    assert after["endpoints"][0]["observation_id"] == 1
+    assert after["endpoints"][0]["revision"] == 2
+
+
+def test_historical_correction_exact_observation_point(history_points):
+    body = historical_correction(
+        history_points, effective_at=2000.0, as_of=250.0, reading=5.0
+    ).json()
+    assert body["bias"] == pytest.approx(3.0)
+    assert body["corrected"] == pytest.approx(8.0)
+    assert body["interval"] is None
+    assert [(e["observation_id"], e["revision"]) for e in body["endpoints"]] == [(2, 1)]
+
+
+def test_historical_correction_far_future_as_of_matches_current(history_points):
+    expected = history_points.post(
+        "/corrections", json={"timestamp": 1500.0, "reading": 5.0}
+    ).json()
+    body = historical_correction(
+        history_points, effective_at=1500.0, as_of=10_000.0, reading=5.0
+    ).json()
+    assert body["bias"] == pytest.approx(expected["bias"])
+    assert body["corrected"] == pytest.approx(expected["corrected"])
+    assert (body["interval"]["t_start"], body["interval"]["t_end"]) == (
+        expected["interval"]["t_start"], expected["interval"]["t_end"])
+    assert [e["observation_id"] for e in body["endpoints"]] == [1, 2]
+    assert all(e["revision"] == 1 for e in body["endpoints"])
+
+
+def test_historical_correction_outside_coverage_rejected(history_points):
+    for ts in (999.0, 3001.0):
+        resp = historical_correction(history_points, effective_at=ts, as_of=300.0, reading=5.0)
+        assert resp.status_code == 400
+        assert "outside calibration coverage" in resp.json()["detail"]
+
+
+def test_historical_correction_without_any_observation_rejected(client):
+    resp = historical_correction(client, effective_at=1.0, as_of=1000.0, reading=5.0)
+    assert resp.status_code == 400
+
+
+def test_historical_correction_is_read_only(history_points):
+    # 先修订一次，让查询路径同时触及快照与当前数据
+    revise_observation(history_points, 1, 1000.0, 10.0, 0.5,
+                       [10.0, 10.1, 9.9], revision=1)
+    set_changed_at(1, revision=1, changed_at=500.0)
+
+    observations_now = history_points.get("/observations").json()
+    intervals_now = history_points.get("/intervals").json()
+    revisions_now = history_points.get("/observations/1/revisions").json()
+
+    # 覆盖各种重建路径：无观测、单点覆盖、旧版本/新版本/当前状态
+    for as_of, expected_status in (
+        (50.0, 400),      # 尚无观测
+        (150.0, 400),     # 仅 id=1 存在，1500 超出当时覆盖
+        (499.0, 200),     # 修订前旧版本
+        (500.0, 200),     # 恰为变更时刻：新版本
+        (10_000.0, 200),  # 全部观测与修订均已生效
+    ):
+        resp = historical_correction(
+            history_points, effective_at=1500.0, as_of=as_of, reading=5.0)
+        assert resp.status_code == expected_status, resp.text
+
+    # 连续只读查询后，当前观测、区间表与修订历史保持不变
+    assert history_points.get("/observations").json() == observations_now
+    assert history_points.get("/intervals").json() == intervals_now
+    assert history_points.get("/observations/1/revisions").json() == revisions_now
+    assert len(revisions_now) == 1
+    assert observations_now[0]["revision"] == 2
+
+
+def test_historical_correction_accepts_iso8601_params(history_points):
+    resp = historical_correction(
+        history_points,
+        effective_at="1970-01-01T00:25:00Z",   # 1500
+        as_of="1970-01-01T00:04:10Z",          # 250
+        reading=5.0,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["timestamp"] == pytest.approx(1500.0)
+    assert body["as_of"] == pytest.approx(250.0)
+    assert body["bias"] == pytest.approx(2.0)
+
+
+def test_historical_correction_missing_params_rejected(history_points):
+    assert history_points.get(
+        "/historical-correction", params={"effective_at": 1500.0, "reading": 5.0}
+    ).status_code == 422
+    assert history_points.get(
+        "/historical-correction", params={"as_of": 250.0, "reading": 5.0}
+    ).status_code == 422
+
+
+def test_historical_correction_historical_outliers_recomputed(history_points):
+    # id=1 修订为无异常读数；as_of=499 的旧版本仍应报告旧异常 20.0
+    revise_observation(history_points, 1, 1000.0, 10.0, 0.5,
+                       [10.0, 10.1, 9.9], revision=1)
+    set_changed_at(1, revision=1, changed_at=500.0)
+
+    before = historical_correction(
+        history_points, effective_at=1000.0, as_of=499.0, reading=0.0
+    ).json()
+    assert before["endpoints"][0]["outliers"] == [20.0]
+    at = historical_correction(
+        history_points, effective_at=1000.0, as_of=500.0, reading=0.0
+    ).json()
+    assert at["endpoints"][0]["outliers"] == []
