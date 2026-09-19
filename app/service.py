@@ -352,6 +352,93 @@ def _endpoint_dict(conn: sqlite3.Connection, obs: sqlite3.Row) -> dict:
     }
 
 
+# ---------- 历史时点漂移补偿（as_of 状态重建） ----------
+
+def _reconstruct_states_as_of(conn: sqlite3.Connection, as_of: float) -> list[dict]:
+    """重建 as_of 系统时点可见的观测状态，按重建后的观测时点升序返回。
+
+    重建规则：
+    - created_at > as_of 的观测尚未创建，不参与；
+    - 修订自 changed_at 时刻起生效（恰等于 changed_at 时使用新版本），
+      因此 changed_at > as_of 的修订一律回滚到 revisions 快照中的旧值；
+      多次修订按版本倒序依次回滚，最终落在 as_of 时点实际生效的版本上。
+    """
+    rows = conn.execute(
+        "SELECT id, ts, bias, revision FROM observations WHERE created_at <= ?",
+        (as_of,),
+    ).fetchall()
+    states = []
+    for row in rows:
+        state = {"id": row["id"], "revision": row["revision"], "ts": row["ts"], "bias": row["bias"]}
+        rolled_back = conn.execute(
+            "SELECT revision, old_ts, old_bias FROM revisions"
+            " WHERE observation_id = ? AND changed_at > ? ORDER BY revision DESC",
+            (row["id"], as_of),
+        ).fetchall()
+        for snap in rolled_back:
+            state["revision"] = snap["revision"]
+            state["ts"] = snap["old_ts"]
+            state["bias"] = snap["old_bias"]
+        states.append(state)
+    states.sort(key=lambda s: s["ts"])
+    return states
+
+
+def historical_correct(effective_at: float, as_of: float, reading: float) -> dict:
+    """按 as_of 系统时点重建校准状态，对 effective_at 时点的读数做漂移补偿。
+
+    只读查询：连接置为 query_only，绝不改写当前观测、修订历史或区间表；
+    区间不读 intervals 表，而是由重建出的观测时点排序后临时相邻配对，
+    覆盖范围判定与线性插值规则与 /corrections 完全一致。
+    """
+    with closing(connect()) as conn:
+        conn.execute("PRAGMA query_only = ON")  # 强制只读，任何写操作都会被 SQLite 拒绝
+        states = _reconstruct_states_as_of(conn, as_of)
+    if not states:
+        raise OutOfCoverageError(effective_at, None, None)
+    exact = next((s for s in states if s["ts"] == effective_at), None)
+    if exact is not None:
+        # 恰落在（重建后的）观测点上：直接使用该点偏差，无需插值
+        bias = exact["bias"]
+        interval = None
+        endpoints = [exact]
+    else:
+        prev = next((s for s in reversed(states) if s["ts"] < effective_at), None)
+        nxt = next((s for s in states if s["ts"] > effective_at), None)
+        if prev is None or nxt is None:
+            raise OutOfCoverageError(effective_at, states[0]["ts"], states[-1]["ts"])
+        bias = calibration.interpolate(effective_at, prev["ts"], prev["bias"], nxt["ts"], nxt["bias"])
+        interval = {
+            "t_start": prev["ts"],
+            "t_end": nxt["ts"],
+            "start_iso": epoch_to_iso(prev["ts"]),
+            "end_iso": epoch_to_iso(nxt["ts"]),
+            "bias_start": prev["bias"],
+            "bias_end": nxt["bias"],
+        }
+        endpoints = [prev, nxt]
+    return {
+        "effective_at": effective_at,
+        "effective_at_iso": epoch_to_iso(effective_at),
+        "as_of": as_of,
+        "as_of_iso": epoch_to_iso(as_of),
+        "reading": reading,
+        "bias": bias,
+        "corrected": reading + bias,
+        "interval": interval,
+        "endpoints": [
+            {
+                "observation_id": s["id"],
+                "revision": s["revision"],
+                "timestamp": s["ts"],
+                "timestamp_iso": epoch_to_iso(s["ts"]),
+                "bias": s["bias"],
+            }
+            for s in endpoints
+        ],
+    }
+
+
 # ---------- 累计漂移量积分 ----------
 
 def drift_integral(frm: float, to: float) -> dict:

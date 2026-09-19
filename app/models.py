@@ -117,6 +117,26 @@ class CorrectionOut(BaseModel):
     endpoints: list[EndpointOut] = Field(description="区间端点观测及其异常读数明细")
 
 
+class HistoricalEndpointOut(BaseModel):
+    observation_id: int
+    revision: int = Field(description="as_of 系统时点该观测所处的版本号")
+    timestamp: float = Field(description="as_of 状态下重建出的观测时点（Unix 秒）")
+    timestamp_iso: str
+    bias: float = Field(description="as_of 状态下该观测的校准偏差")
+
+
+class HistoricalCorrectionOut(BaseModel):
+    effective_at: float = Field(description="目标观测时点（Unix 秒）")
+    effective_at_iso: str
+    as_of: float = Field(description="系统时点（Unix 秒）：校准状态按该时刻重建")
+    as_of_iso: str
+    reading: float
+    bias: float
+    corrected: float
+    interval: IntervalOut | None = Field(description="重建状态下所用的插值区间；恰落在观测点上时为 null")
+    endpoints: list[HistoricalEndpointOut] = Field(description="所用端点的观测 ID 与 as_of 时点版本")
+
+
 class DriftContributionOut(BaseModel):
     t_start: float = Field(description="裁剪后子段起点（Unix 秒）")
     t_end: float = Field(description="裁剪后子段终点（Unix 秒）")
